@@ -1,0 +1,269 @@
+---
+title: "final"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(dplyr)
+library(broom)
+```
+
+This is the data for the League of Legends 2018 Spring split matches.
+
+```{r}
+dat <- read.csv("2018-spring-match-data-OraclesElixir-2018-05-02.csv", fileEncoding="UTF-8-BOM")
+```
+
+We will only be looking at the data for North America, NALCS.
+
+```{r}
+dat <- dat %>% filter(league == "NALCS")
+
+dat[,"team"] <- as.character(dat[,"team"])
+dat[,"team"] <- as.factor(dat[,"team"])
+
+games <-
+  dat %>%
+  filter(position == "Team", side == "Blue") %>%
+  nrow()
+games
+```
+
+We'll do some cursory data analysis, then try to predict game outcomes.
+
+We first examine the win rates for the two sides, blue and red. Historically blue side has had a higher win rate over red side, so we will expect to see the same now.
+
+```{r}
+dat %>%
+  filter(position == "Team") %>%
+  group_by(side) %>%
+  summarize(wins = sum(result)) %>%
+  mutate(winr = wins/117) %>%
+  ggplot(aes(side, winr)) + geom_col() + xlab("Side") + ylab("Win rate") + ggtitle("Win rates of each side") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+Blue side has a winrate of over 0.6, compared to red side's 0.4
+
+There have been different patches throughout the season as well. We examine how the game lengths have changed across the season.
+
+```{r}
+dat %>%
+  group_by(gameid) %>%
+  ggplot(aes(factor(week, levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "T", "QF", "SF", "3P", "F")), gamelength)) + geom_point(aes(color = factor(patchno))) + xlab("Week") + ylab("Game length") + ggtitle("Game length across the weeks") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+We can see that the game length slightly decreases across the weeks.
+
+Each team member on the team has a different amount of "carry potential", which is the potential of them carrying the game given a gold lead. We want to investigate the differences in carry potential between the roles on each team. To do this we will fit a logistic regression model on the game result given the gold advantage at 15 minutes for each player.
+
+```{r}
+pos_dat <-
+  dat %>%
+  filter(position != "Team") %>%
+  dplyr::select(gameid, result, position, gdat15) %>%
+  gather(key, val, gdat15) %>%
+  unite(key1, key, position) %>%
+  spread(key1, val)
+```
+
+```{r}
+carry_model <- glm(result~.-1, data=pos_dat %>% dplyr::select(-gameid), family=binomial)
+carry_model %>% 
+  tidy() %>%
+  knitr::kable(digits=4)
+```
+
+We can clearly see from this model that the ADC has the most carry potential -- if they have a gold lead at 15 minutes, the team is much more likely to win than if the Top or Support have a gold lead at 15. Interestingly, the Top lane has less carry potential than Support. This may be because support can build key utility items such as Redemption and Ardent Censer, whereas Top Lane mainly consists of tanks, who only need a couple tank items to be useful.
+
+There was a big change in the jungle midway through the split that decreased their ability to place wards on the map. We expect to see a drop in wards for the junglers on all teams.
+
+```{r}
+dat %>%
+  filter(position == "Jungle") %>%
+  dplyr::select(patchno, wpm) %>%
+  ggplot(aes(factor(patchno), wpm)) + geom_point()
+```
+
+There is a drop present in patch 8.04, which is when the change occured. The wards per minute placed by junglers increased again in 8.05, as teams adapted to the change and purchased more wards on junglers.
+
+We will try to predict game outcomes by predicting kills per side per game.
+
+In League of Legends, kills are tracked and are a big part of the game, but they do not determine the game. The game is won by destroying the enemy team's Nexus, which is a building in their base. Thus it is possible for the winning team to have less kills than the losing team. We want to determine how likely a team is to win given their KDA (kills, deaths, assists). To do this we will train a logistic regression classifier using the data from each team in each game.
+
+```{r, warning=FALSE, message=FALSE}
+library(randomForest)
+library(caret)
+```
+
+```{r}
+set.seed(1234)
+
+rf_dat <-
+  dat %>%
+  filter(position == "Team") %>%
+  dplyr::select(result, k, d, a)
+
+rf_dat$result <- as.factor(rf_dat$result)
+
+#train_control <- trainControl(method="cv", number=10)
+
+#model <- train(result~., data=rf_dat, method="glm", family="binomial", trControl=train_control)
+kp_model <- glm(result~., data=rf_dat, family="binomial")
+
+kp_model %>%
+  tidy() %>%
+  knitr::kable(digits=4)
+```
+
+We see that kills and deaths significantly predict game results, but assists don't.
+This is to be expected, since a team that has few kills can still have many assists if each team member participated in the kill. However, assists give an essentially negligible amount of gold compared to a kill.
+
+We want to examine the distribution of kills for each team.
+
+```{r}
+kills <-
+  dat %>%
+  filter(position == "Team") %>%
+  dplyr::select(k)
+
+summary(kills)
+sd(kills$k)^2
+```
+
+```{r}
+kills %>%
+  ggplot(aes(k)) + geom_histogram(binwidth = 1)
+```
+
+Since kills can be used to predict game results, we would like to predict kills in a game between particular teams. To model the kills by each side in a game, the first distribution that comes to mind is the poission distribution. However, the poission distribution models models rare events where the variance is equal to the mean, but for kills the variance does not the mean. In this case we will use the negative binomial distribution.
+
+We will train this on the regular season data (Weeks 1 - 9) and test it on playoffs (T, QF, SF, 3P, F).
+We will only use data from before the match has started to predict, so we will use the team, opposition, and side.
+
+```{r, warning=FALSE, message=FALSE}
+library(MASS)
+```
+
+```{r}
+kills_dat <-
+  dat %>%
+  filter(position == "Team") %>%
+  dplyr::select(gameid, side, team, k, week, result)
+  #gather(key, val, team, k) %>%
+  #unite(key1, key, side) %>%
+  #spread(key1, val)
+
+opp_teams <- matrix(NA, nrow(kills_dat),1)
+
+for (i in seq(1, nrow(kills_dat))) {
+  gameid <- kills_dat[i,]$gameid
+  c_side <- kills_dat[i,]$side
+  opp_team <- kills_dat[kills_dat$gameid == gameid & kills_dat$side != c_side,]$team
+  kills_dat[i,"opp_team"] <- as.character(opp_team)
+}
+
+kills_dat[,"opp_team"] <- as.factor(kills_dat[,"opp_team"])
+
+kills_dat_tr <-
+  kills_dat %>%
+  dplyr::select(-result) %>%
+  filter(is.element(week, c(1, 2, 3, 4, 5, 6, 7, 8, 9)))
+
+kills_dat_te <-
+  kills_dat %>%
+  dplyr::select(-result) %>%
+  filter(is.element(week, c("T", "QF", "SF", "3P", "F")))
+```
+
+```{r}
+kills_model <- glm.nb(k~team+side+opp_team, data=kills_dat_tr %>% dplyr::select(-week))
+summary(kills_model)
+```
+
+```{r}
+predict(kills_model, newdata=data.frame(side="Blue", team="Team Liquid", opp_team="100 Thieves"))
+predict(kills_model, newdata=data.frame(side="Blue", team="Echo Fox", opp_team="OpTic Gaming"))
+predict(kills_model, newdata=data.frame(side="Red", team="OpTic Gaming", opp_team="Clutch Gaming"))
+```
+
+However, we see that all predicted values for the kills are extremely small -- they end to range between 1 and 3. Thus the negative binomial model was not successful at predicting kills per game.
+
+```{r}
+kills_dat_te %>%
+  mutate(pred_k = predict(kills_model, newdata=kills_dat_te)) %>%
+  mutate(error = (k - pred_k)^2)
+```
+
+We will try to use a gaussian distribution instead. A lognormal distribution is most likely not necessary since it is very unlikely for the model to predict a negative value, and the model also cannot predict 0.
+
+```{r}
+kills_model2 <- glm(k~team+side+opp_team, data=kills_dat_tr %>% dplyr::select(-week), family=gaussian)
+summary(kills_model2)
+```
+
+```{r}
+predict(kills_model2, newdata=data.frame(side="Blue", team="Team Liquid", opp_team="100 Thieves"))
+predict(kills_model2, newdata=data.frame(side="Blue", team="Echo Fox", opp_team="OpTic Gaming"))
+predict(kills_model2, newdata=data.frame(side="Red", team="OpTic Gaming", opp_team="Clutch Gaming"))
+```
+
+```{r}
+kills_dat_te %>%
+  mutate(pred_k = predict(kills_model2, newdata=kills_dat_te)) %>%
+  mutate(error = (k - pred_k)^2)
+```
+
+We see that this model is much better at predicting kills than the previous.
+
+Let's try to use the models to predict playoffs wins.
+
+```{r}
+playoffs_dat <-
+  kills_dat %>%
+  filter(is.element(week, c("T", "QF", "SF", "3P", "F")))
+
+pred_results <-
+  playoffs_dat %>%
+  mutate(pred_k = predict(kills_model, newdata=playoffs_dat)) %>%
+  dplyr::select(-opp_team) %>%
+  #mutate(error = (k - pred_k)^2) %>%
+  gather(key, val, team, k, pred_k, result) %>%
+  unite(key1, key, side) %>%
+  spread(key1, val) %>%
+  mutate(winner = ifelse(result_Blue == 1, team_Blue, team_Red)) %>%
+  dplyr::select(-result_Blue, -result_Red) %>%
+  mutate(pred_winner = ifelse(pred_k_Blue >= pred_k_Red, team_Blue, team_Red)) %>%
+  mutate(correct = ifelse(winner == pred_winner, 1, 0))
+
+sum(pred_results$correct) / nrow(pred_results)
+```
+
+```{r}
+playoffs_dat <-
+  kills_dat %>%
+  filter(is.element(week, c("T", "QF", "SF", "3P", "F")))
+
+pred_results2 <-
+  playoffs_dat %>%
+  mutate(pred_k = predict(kills_model2, newdata=playoffs_dat)) %>%
+  dplyr::select(-opp_team) %>%
+  #mutate(error = (k - pred_k)^2) %>%
+  gather(key, val, team, k, pred_k, result) %>%
+  unite(key1, key, side) %>%
+  spread(key1, val) %>%
+  mutate(winner = ifelse(result_Blue == 1, team_Blue, team_Red)) %>%
+  dplyr::select(-result_Blue, -result_Red) %>%
+  mutate(pred_winner = ifelse(pred_k_Blue >= pred_k_Red, team_Blue, team_Red)) %>%
+  mutate(correct = ifelse(winner == pred_winner, 1, 0))
+
+sum(pred_results2$correct) / nrow(pred_results2)
+```
+
+Interestingly, the negative binomial model is more accurate than the gaussian one despite having a high error rate. However, this test is extremely inaccurate because of the small amount of testing data.
+
+Data is also very limited for training this model. Given more data (more splits), we can try to incorporate champions picked into the model to more accurately predict the result.
+
+A better distribution to model the kills may also be helpful, since negative binomial and gaussian do not seem to be very accurate.
